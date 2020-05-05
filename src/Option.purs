@@ -58,11 +58,12 @@ module Option
   ) where
 
 import Prelude
+
 import Control.Monad.Except as Control.Monad.Except
 import Control.Monad.Reader.Trans as Control.Monad.Reader.Trans
+import Control.Monad.State as Control.Monad.State
 import Control.Monad.Writer as Control.Monad.Writer
 import Control.Monad.Writer.Class as Control.Monad.Writer.Class
-import Control.Monad.State as Control.Monad.State
 import Data.Argonaut.Core as Data.Argonaut.Core
 import Data.Argonaut.Decode.Class as Data.Argonaut.Decode.Class
 import Data.Argonaut.Encode.Class as Data.Argonaut.Encode.Class
@@ -81,6 +82,7 @@ import Foreign.Object as Foreign.Object
 import Prim.Row as Prim.Row
 import Prim.RowList as Prim.RowList
 import Record as Record
+import Record.Builder as Record.Builder
 import Simple.JSON as Simple.JSON
 import Type.Equality as Type.Equality
 import Unsafe.Coerce as Unsafe.Coerce
@@ -398,7 +400,7 @@ else instance eqOptionCons ::
 -- | ```
 -- |
 -- | Not only does it save a bunch of typing, it also mitigates the need for a direct dependency on `SProxy _`.
-class FromRecord (record :: #Type) (option :: #Type) where
+class FromRecord (record :: #Type) (required :: #Type) (option :: #Type) | record -> option required where
   -- | The given `Record record` must have no more fields than the expected `Option _`.
   -- |
   -- | E.g. The following definitions are valid.
@@ -420,7 +422,7 @@ class FromRecord (record :: #Type) (option :: #Type) where
   -- | option4 :: Option.Option ( foo :: Boolean, bar :: Int )
   -- | option4 = Option.fromRecord' { qux: [] }
   -- | ```
-  fromRecord' :: Record record -> Option option
+  fromRecord' :: Record record -> { optional :: Option option, required :: { | required } }
 
 -- | This instance converts a record into an option.
 -- |
@@ -428,12 +430,53 @@ class FromRecord (record :: #Type) (option :: #Type) where
 -- |
 -- | Any fields in the expected option that do not exist in the record are not added.
 instance fromRecordAny ::
-  ( FromRecordOption list record option
-  , Prim.RowList.RowToList record list
+  ( FromRecordOption optionalList record option
+  , FromRecordRequired requiredList record () required
+  , Prim.RowList.RowToList optionalRowsForLookup optionalList
+  , Prim.Row.Union required optionalRowsForLookup record -- givenRecordRows - requiredRows = optionalRowsForLookup
+  , Prim.RowList.RowToList required requiredList
   ) =>
-  FromRecord record option where
-  fromRecord' :: Record record -> Option option
-  fromRecord' = fromRecordOption (Proxy :: Proxy list)
+  FromRecord record required option where
+  --  fromRecord' :: Record record -> Option option
+  fromRecord' record =
+    { optional: fromRecordOption (Proxy :: Proxy optionalList) record
+    , required: Record.Builder.build (fromRecordRequired (Proxy :: _ requiredList) record) {}
+    }
+
+class FromRecordRequired (list :: Prim.RowList.RowList) (record :: #Type) (from :: #Type) (required :: #Type) | list -> required record from where
+  fromRecordRequired ::
+    forall proxy.
+    proxy list ->
+    Record record ->
+    Record.Builder.Builder { | from } { | required }
+
+instance fromRecordRequiredNil :: FromRecordRequired Prim.RowList.Nil record () () where
+  fromRecordRequired _ _ = identity
+
+instance fromRecordRequiredCons ::
+  ( Data.Symbol.IsSymbol label
+  , FromRecordRequired list recordRows from mid
+  , Prim.Row.Cons label value trash_ recordRows
+  , Prim.Row.Cons label value mid to
+  , Prim.Row.Lacks label mid
+  ) =>
+  FromRecordRequired (Prim.RowList.Cons label value list) recordRows from to where
+  fromRecordRequired _ record = first <<< rest
+    where
+    first :: Record.Builder.Builder { | mid } { | to }
+    first = Record.Builder.insert label value
+
+    value :: value
+    value = Record.get label record
+
+    rest :: Record.Builder.Builder { | from } { | mid }
+    rest = fromRecordRequired proxy record
+
+    proxy :: Proxy list
+    proxy = Proxy
+
+    label :: Data.Symbol.SProxy label
+    label = Data.Symbol.SProxy
 
 -- | A typeclass that iterates a `RowList` converting a `Record _` into an `Option _`.
 class FromRecordOption (list :: Prim.RowList.RowList) (record :: #Type) (option :: #Type) | list -> option record where
@@ -446,12 +489,13 @@ class FromRecordOption (list :: Prim.RowList.RowList) (record :: #Type) (option 
     Record record ->
     Option option
 
-instance fromRecordOptionNil :: FromRecordOption Prim.RowList.Nil () option where
-  fromRecordOption ::
-    forall proxy.
-    proxy Prim.RowList.Nil ->
-    Record () ->
-    Option option
+-- all of the recordRows kasi baka un iba wala -- zzz
+instance fromRecordOptionNil :: FromRecordOption Prim.RowList.Nil record option where
+  -- fromRecordOption ::
+  --   forall proxy.
+  --   proxy Prim.RowList.Nil ->
+  --   Record () ->
+  --   Option option
   fromRecordOption _ _ = empty
 else instance fromRecordOptionCons ::
   ( Data.Symbol.IsSymbol label
@@ -1137,10 +1181,10 @@ empty = Option Foreign.Object.empty
 -- |
 -- | This is an alias for `fromRecord'` so the documentation is a bit clearer.
 fromRecord ::
-  forall option record.
-  FromRecord record option =>
+  forall option required record.
+  FromRecord record required option =>
   Record record ->
-  Option option
+  { optional :: Option option, required :: { | required } }
 fromRecord = fromRecord'
 
 -- | Attempts to fetch the value at the given key from an option.
@@ -1458,10 +1502,10 @@ user4 = delete (Data.Symbol.SProxy :: _ "age") user
 user5 :: Option ( username :: String, age :: Boolean )
 user5 = modify (Data.Symbol.SProxy :: _ "age") (\_ -> true) user
 
-user6 :: User
+user6 :: { optional :: User, required :: {} }
 user6 = fromRecord {}
 
-user7 :: User
+user7 :: { optional :: User, required :: {} }
 user7 = fromRecord { age: 10 }
 
 user8 :: { age :: Data.Maybe.Maybe Int, username :: Data.Maybe.Maybe String }
@@ -1469,3 +1513,22 @@ user8 = toRecord user
 
 user9 :: Data.Maybe.Maybe { age :: Int, username :: String }
 user9 = getAll user
+
+testing :: { optional :: Option ( title :: String ), required :: { name :: String } }
+testing = fromRecord { title: "Mr.", name: "" }
+
+greet ::
+  forall record.
+  FromRecord record ( name :: String ) ( title :: String, greeting :: String ) =>
+  { | record } -> String
+greet r =
+  let
+    { required, optional } = fromRecord r
+
+    greeting = Data.Maybe.fromMaybe "Hi" (get (Data.Symbol.SProxy :: _ "greeting") optional)
+
+    title = case (get (Data.Symbol.SProxy :: _ "title") optional) of
+      Data.Maybe.Just v -> v <> " "
+      Data.Maybe.Nothing -> ""
+  in
+    greeting <> ", " <> title <> required.name
